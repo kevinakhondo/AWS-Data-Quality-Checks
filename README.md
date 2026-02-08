@@ -267,10 +267,10 @@ for rule in rules_json['Rules']:
         failed_rules += 1
         if rule['Severity'] == 'Critical':
             critical_failures += 1
-            print(f"❌ CRITICAL FAILURE: {rule_name} - {rule['Description']}")
+            print(f" CRITICAL FAILURE: {rule_name} - {rule['Description']}")
     else:
         passed_rules += 1
-        print(f"✅ PASSED: {rule_name}")
+        print(f"PASSED: {rule_name}")
 
 # Write results to CloudWatch
 log_group = f"/aws/glue/data-quality/{args['DATABASE_NAME']}"
@@ -290,18 +290,178 @@ print(f"\nSummary: {json.dumps(summary, indent=2)}")
 # Fail job if critical rules failed
 if critical_failures > 0:
     error_msg = f"Data Quality Check FAILED: {critical_failures} critical rule(s) violated"
-    print(f"\n❌ {error_msg}")
+    print(f"\n {error_msg}")
     raise Exception(error_msg)
 else:
-    print(f"\n✅ Data Quality Check PASSED: All {passed_rules} rules validated successfully")
+    print(f"\n Data Quality Check PASSED: All {passed_rules} rules validated successfully")
 
 job.commit()
 
 ```
+## Step 4: Update Terraform Glue Workflow
+The purpose is to remove the old ETL trigger and use the new one.
+### Create a back up of Original Glue.tf
 
+```
+# Navigate to the terraform folder
+cd ~/glue-etl-pipeline/terraform
 
+# Verify you're in the right place
+pwd
+```
+Now create the back up
+```
+# Create a backup copy
+cp glue.tf glue.tf.backup
 
+# Verify backup was created
+ls -la glue.tf*
+```
+### Understanding the Problem
+Apparently, the original glue.tf trigger crawls the raw data followed by ETL immediately. What we need is that after the raw crawler runs, data quality checks runs and then ETL comes last.
 
+The new triggers are in data_quality.tf:
+- run_data_quality trigger: Raw Crawler → Data Quality Job
+- run_etl_job_v2 trigger: Data Quality Job → ETL Job
+
+So we need to delete or comment out the old run_etl_job trigger found in _glue.tf_.
+### Edit glue.tf File
+The easiest way is to delete it entirely. Sometimes, you could run into errors. If it happens, replace the entire file with
+```
+
+# Glue Database
+resource "aws_glue_catalog_database" "data_lake_db" {
+  name        = "${var.project_name}_database"
+  description = "E-commerce data lake database"
+}
+
+# Glue Crawler for Raw Data
+resource "aws_glue_crawler" "raw_crawler" {
+  name          = "${var.project_name}-raw-crawler"
+  role          = aws_iam_role.glue_service_role.arn
+  database_name = aws_glue_catalog_database.data_lake_db.name
+
+  s3_target {
+    path = "s3://${aws_s3_bucket.data_lake.id}/raw/"
+  }
+
+  schema_change_policy {
+    delete_behavior = "LOG"
+    update_behavior = "UPDATE_IN_DATABASE"
+  }
+
+  configuration = jsonencode({
+    Version = 1.0
+    CrawlerOutput = {
+      Partitions = { AddOrUpdateBehavior = "InheritFromTable" }
+    }
+  })
+}
+
+# Glue Crawler for Processed Data
+resource "aws_glue_crawler" "processed_crawler" {
+  name          = "${var.project_name}-processed-crawler"
+  role          = aws_iam_role.glue_service_role.arn
+  database_name = aws_glue_catalog_database.data_lake_db.name
+
+  s3_target {
+    path = "s3://${aws_s3_bucket.data_lake.id}/processed/transactions/"
+  }
+
+  schema_change_policy {
+    delete_behavior = "LOG"
+    update_behavior = "UPDATE_IN_DATABASE"
+  }
+
+  configuration = jsonencode({
+    Version = 1.0
+    CrawlerOutput = {
+      Partitions = { AddOrUpdateBehavior = "InheritFromTable" }
+    }
+  })
+}
+
+# Glue ETL Job
+resource "aws_glue_job" "etl_job" {
+  name     = "${var.project_name}-etl-job"
+  role_arn = aws_iam_role.glue_service_role.arn
+
+  glue_version      = var.glue_version
+  worker_type       = var.worker_type
+  number_of_workers = var.number_of_workers
+
+  command {
+    name            = "glueetl"
+    script_location = "s3://${aws_s3_bucket.data_lake.id}/scripts/glue_etl_job.py"
+    python_version  = "3"
+  }
+
+  default_arguments = {
+    "--job-language"                     = "python"
+    "--job-bookmark-option"              = "job-bookmark-enable"
+    "--enable-metrics"                   = "true"
+    "--enable-spark-ui"                  = "true"
+    "--enable-job-insights"              = "true"
+    "--enable-glue-datacatalog"          = "true"
+    "--enable-continuous-cloudwatch-log" = "true"
+    "--SOURCE_BUCKET"                    = aws_s3_bucket.data_lake.id
+    "--TARGET_BUCKET"                    = aws_s3_bucket.data_lake.id
+    "--TempDir"                          = "s3://${aws_s3_bucket.data_lake.id}/temporary/"
+  }
+
+  execution_property {
+    max_concurrent_runs = 1
+  }
+
+  timeout = 60
+}
+
+# Glue Workflow
+resource "aws_glue_workflow" "etl_workflow" {
+  name        = "${var.project_name}-workflow"
+  description = "End-to-end ETL workflow with data quality checks"
+}
+
+# Trigger: Start raw crawler on-demand
+resource "aws_glue_trigger" "start_raw_crawler" {
+  name          = "${var.project_name}-start-raw-crawler"
+  type          = "ON_DEMAND"
+  workflow_name = aws_glue_workflow.etl_workflow.name
+
+  actions {
+    crawler_name = aws_glue_crawler.raw_crawler.name
+  }
+}
+
+# NOTE: The old "run_etl_job" trigger has been REMOVED
+# New workflow is defined in data_quality.tf:
+#   1. Raw Crawler (start_raw_crawler)
+#   2. Data Quality Job (run_data_quality in data_quality.tf)
+#   3. ETL Job (run_etl_job_v2 in data_quality.tf)
+#   4. Processed Crawler (catalog_processed_data below)
+
+# Trigger: Catalog processed data after ETL job succeeds
+resource "aws_glue_trigger" "catalog_processed_data" {
+  name          = "${var.project_name}-catalog-processed"
+  type          = "CONDITIONAL"
+  workflow_name = aws_glue_workflow.etl_workflow.name
+
+  predicate {
+    conditions {
+      job_name = aws_glue_job.etl_job.name
+      state    = "SUCCEEDED"
+    }
+  }
+
+  actions {
+    crawler_name = aws_glue_crawler.processed_crawler.name
+  }
+
+  start_on_creation = true
+}
+
+```
+## Validate and Run Terraform
 
 
 
